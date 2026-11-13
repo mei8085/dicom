@@ -70,6 +70,11 @@ func ParseUntilEOF(in io.Reader, frameChan chan *frame.Frame, opts ...ParseOptio
 func parseInternal(in io.Reader, bytesToRead int64, frameChan chan *frame.Frame, opts ...ParseOption) (Dataset, error) {
 	p, err := NewParser(in, bytesToRead, frameChan, opts...)
 	if err != nil {
+		// The parser never started, but the caller may be ranging over the
+		// frame channel; close it so that consumer does not wait forever.
+		if frameChan != nil {
+			close(frameChan)
+		}
 		return Dataset{}, err
 	}
 
@@ -82,15 +87,16 @@ func parseInternal(in io.Reader, bytesToRead int64, frameChan chan *frame.Frame,
 				break
 			}
 
-			// exit on error
-			return p.dataset, err
+			// exit on error. The dataset may hold only part of the elements
+			// the input declared, so it is not returned: callers must not use
+			// partially parsed data as if the parse had succeeded.
+			p.closeFrameChannel()
+			return Dataset{}, err
 		}
 	}
 
 	// Close the frameChannel if needed
-	if p.frameChannel != nil {
-		close(p.frameChannel)
-	}
+	p.closeFrameChannel()
 	return p.dataset, nil
 }
 
@@ -130,10 +136,14 @@ type Parser struct {
 // provided).
 func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, opts ...ParseOption) (*Parser, error) {
 	optSet := toParseOptSet(opts...)
+	if err := optSet.budget.validate(); err != nil {
+		return nil, err
+	}
 	p := Parser{
 		reader: &reader{
 			rawReader: dicomio.NewReader(bufio.NewReader(in), binary.LittleEndian, bytesToRead),
 			opts:      optSet,
+			budget:    newBudget(optSet.budget),
 		},
 		frameChannel: frameChannel,
 	}
@@ -161,13 +171,21 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, 
 
 	ts, err := p.dataset.FindElementByTag(tag.TransferSyntaxUID)
 	if err == nil {
-		// If we found the transfer syntax, apply it.
-		tsStr := MustGetStrings(ts.Value)[0]
+		// If we found the transfer syntax, apply it. The value comes from
+		// untrusted input, so it is read without the panicking Must* helpers.
+		tsStrs, ok := ts.Value.GetValue().([]string)
+		if !ok || len(tsStrs) == 0 {
+			return nil, fmt.Errorf("TransferSyntaxUID has no string value: %w", ErrorElementNotFound)
+		}
+		tsStr := tsStrs[0]
 		bo, implicit, err = uid.ParseTransferSyntaxUID(tsStr)
-		if err != nil {
+		if err != nil || bo == nil {
 			// TODO(suyashkumar): should we attempt to parse with LittleEndian
 			// Implicit here?
 			debug.Log("WARN: could not parse transfer syntax uid in metadata")
+			// Keep a usable default rather than a nil ByteOrder, which would
+			// panic on the next read.
+			bo, implicit = binary.LittleEndian, true
 		}
 		if tsStr == uid.DeflatedExplicitVRLittleEndian {
 			p.reader.rawReader.SetDeflate()
@@ -235,31 +253,42 @@ func canReadElementFromBytes(buf []byte, optSet parseOptSet, bo binary.ByteOrder
 // Next parses and returns the next top-level element from the DICOM this Parser points to.
 func (p *Parser) Next() (*Element, error) {
 	if !p.reader.moreToRead() {
-		// Close the frameChannel if needed
-		if p.frameChannel != nil {
-			close(p.frameChannel)
-		}
+		p.closeFrameChannel()
 		return nil, ErrorEndOfDICOM
 	}
 	elem, err := p.reader.readElement(&p.dataset, p.frameChannel)
 	if err != nil {
 		// TODO: tolerate some kinds of errors and continue parsing
+		p.closeFrameChannel()
 		return nil, err
 	}
 
 	// TODO: add dicom options to only keep track of certain tags
 
 	if elem.Tag == tag.SpecificCharacterSet {
-		encodingNames := MustGetStrings(elem.Value)
-		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
-		if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
-			return nil, err
+		// The value comes from untrusted input, so a wrong type is tolerated
+		// rather than panicking: only a valid string list selects an encoding.
+		if encodingNames, ok := elem.Value.GetValue().([]string); ok {
+			cs, err := charset.ParseSpecificCharacterSet(encodingNames)
+			if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
+				p.closeFrameChannel()
+				return nil, err
+			}
+			p.reader.rawReader.SetCodingSystem(cs)
 		}
-		p.reader.rawReader.SetCodingSystem(cs)
 	}
 
 	p.dataset.Elements = append(p.dataset.Elements, elem)
 	return elem, nil
+}
+
+// closeFrameChannel closes the frame channel if one was provided, and clears
+// it so a later call does not close it twice.
+func (p *Parser) closeFrameChannel() {
+	if p.frameChannel != nil {
+		close(p.frameChannel)
+		p.frameChannel = nil
+	}
 }
 
 // GetMetadata returns just the set of metadata elements that have been parsed
@@ -284,10 +313,11 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+	budget                             ParseBudget
 }
 
 func toParseOptSet(opts ...ParseOption) parseOptSet {
-	optSet := parseOptSet{}
+	optSet := parseOptSet{budget: DefaultParseBudget()}
 	for _, opt := range opts {
 		opt(&optSet)
 	}

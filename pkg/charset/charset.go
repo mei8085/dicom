@@ -89,7 +89,10 @@ func ParseSpecificCharacterSet(encodingNames []string) (CodingSystem, error) {
 			if htmlName != "" {
 				d, err := htmlindex.Get(htmlName)
 				if err != nil {
-					panic(fmt.Sprintf("Encoding name %s (for %s) not found", name, htmlName))
+					// A name from the table that the encoding index does not
+					// know is a library/version mismatch, not a property of the
+					// input; report it as an error instead of panicking.
+					return CodingSystem{}, fmt.Errorf("ParseSpecificCharacterSet: encoding %s (for %s) not found: %w", htmlName, name, err)
 				}
 				c = d.NewDecoder()
 			}

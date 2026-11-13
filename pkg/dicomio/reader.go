@@ -47,12 +47,22 @@ func NewReader(in *bufio.Reader, bo binary.ByteOrder, limit int64) *Reader {
 	}
 }
 
+// ExactLimit reports whether the reader's limit counts bytes the underlying
+// input actually holds. It is false for LimitReadUntilEOF and for deflated
+// input, where a declared length cannot be validated against the bytes left
+// before reading.
+func (r *Reader) ExactLimit() bool { return r.limit != LimitReadUntilEOF }
+
 func (r *Reader) BytesLeftUntilLimit() int64 {
 	if r.limit == LimitReadUntilEOF {
 		return math.MaxInt64
 	}
 	return r.limit - r.bytesRead
 }
+
+// BytesRead returns the number of bytes consumed from the underlying reader
+// so far. It is useful for reporting the position of a malformed element.
+func (r *Reader) BytesRead() int64 { return r.bytesRead }
 
 func (r *Reader) Read(p []byte) (int, error) {
 	// Check if we've hit the limit
@@ -141,12 +151,67 @@ func internalReadString(data []byte, d *encoding.Decoder) (string, error) {
 
 // ReadString reads a string from the underlying *Reader.
 func (r *Reader) ReadString(n uint32) (string, error) {
-	data := make([]byte, n)
-	_, err := io.ReadFull(r, data)
+	data, err := r.ReadBytes(int64(n))
 	if err != nil {
 		return "", err
 	}
 	return internalReadString(data, r.cs.Ideographic)
+}
+
+// growChunk is the most ReadBytes allocates beyond the bytes read so far when
+// the reader cannot know up front how many bytes its input holds.
+const growChunk = 64 << 10
+
+// ReadBytes reads exactly n bytes into a new slice. A length past the current
+// limit is refused with ErrorInsufficientBytesLeft before anything is
+// allocated. When the limit is exact (see ExactLimit), the slice is allocated
+// once from n; otherwise it grows as bytes arrive, so a declared length the
+// input does not hold costs only what the input actually supplies.
+func (r *Reader) ReadBytes(n int64) ([]byte, error) {
+	if n < 0 || (r.ExactLimit() && n > r.BytesLeftUntilLimit()) {
+		return nil, ErrorInsufficientBytesLeft
+	}
+	if r.ExactLimit() {
+		data := make([]byte, n)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
+
+	// Unknown total size (LimitReadUntilEOF or deflated input): grow in chunks
+	// so a bogus declared length waits for real bytes before being allocated.
+	data := make([]byte, 0, min64(n, growChunk))
+	for int64(len(data)) < n {
+		if int64(cap(data)) == int64(len(data)) {
+			want := min64(n, int64(cap(data))+growChunk)
+			grown := make([]byte, len(data), want)
+			copy(grown, data)
+			data = grown
+		}
+		want := min64(n, int64(cap(data)))
+		got, err := io.ReadFull(r, data[len(data):want])
+		data = data[:int64(len(data))+int64(got)]
+		if err != nil {
+			// n > 0 bytes were requested, so io.EOF means the value is
+			// truncated, not that the input ended cleanly. Reporting EOF would
+			// let callers (which often treat it as a normal end) accept a
+			// partial value.
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
+// min64 returns the smaller of two non-negative int64s.
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Skip skips the *Reader ahead by n bytes.

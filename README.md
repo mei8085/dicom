@@ -39,6 +39,50 @@ fmt.Println(j)
 ```
 More details about the package (and additional examples and APIs) can be found in the [godoc](https://godoc.org/github.com/suyashkumar/dicom).
 
+### Parse budget for untrusted input
+
+A DICOM file declares the length of each value, and a malformed file can
+declare a length it does not contain. The parser therefore bounds the work it
+does per parse:
+
+- a single value, sequence scope, item, encapsulated frame, or native pixel
+  buffer may not reserve more than `ParseBudget.MaxElementBytes`
+  (`DefaultMaxElementBytes`, 256 MiB, by default);
+- the whole parse may not read or reserve more than `ParseBudget.MaxParseBytes`
+  (`DefaultMaxParseBytes`, 1 GiB, by default), which also bounds undefined
+  length structures that have no length to check;
+- sequences may not nest deeper than `ParseBudget.MaxNestingDepth`
+  (`DefaultMaxNestingDepth`, 64, by default).
+
+These checks run before a value is allocated or read, so a malformed file
+fails with a locatable error (`ErrorParseBudgetExceeded`,
+`ErrorSequenceTooDeep`, or `ErrorInvalidPixelDimensions`) rather than with an
+allocation it cannot support. A failed parse returns no partial dataset. Use
+`errors.Is` to tell the errors apart.
+
+Legal but large images keep working: raise the budget for them explicitly.
+
+```go
+budget := dicom.DefaultParseBudget()
+budget.MaxElementBytes = 2 << 30 // allow 2 GiB values
+dataset, err := dicom.ParseFile("large.dcm", nil, dicom.WithParseBudget(budget))
+switch {
+case errors.Is(err, dicom.ErrorParseBudgetExceeded):
+    // the input declared or contained more than the budget allows
+case errors.Is(err, dicom.ErrorSequenceTooDeep):
+    // sequences nested too deeply
+}
+```
+
+Individual limits can also be changed with the `MaxElementBytes`,
+`MaxParseBytes`, and `MaxNestingDepth` options. A zero field in a `ParseBudget`
+disables that limit; the zero `ParseBudget` disables budgeting entirely and
+restores the historical behavior. When `bytesToRead` is exact (`Parse`, not
+`ParseUntilEOF`), a declared length larger than the remaining input is rejected
+even if it is within the budget. `ParseUntilEOF` grows values as bytes arrive,
+so a declared length the input does not hold costs no more than the input
+itself.
+
 ## CLI Tool
 A CLI tool that uses this package to parse imagery and metadata out of DICOMs is provided in the `cmd/dicomutil` package. This tool can take in a DICOM, and dump out all the elements to STDOUT, in addition to writing out any imagery to the current working directory either as PNGs or JPEG (note, it does not perform any automatic color rescaling by default).
 
