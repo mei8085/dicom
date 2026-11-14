@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -34,7 +35,44 @@ var (
 	ErrorExpectedEvenLength           = errors.New("field length is not even, in violation of DICOM spec")
 	ErrorExpectedDefinedLength        = errors.New("unable to read field of undefined length")
 	ErrorExpectedSequenceDelimitation = errors.New("expected to find sequence delimitation item (fffe,e0dd)")
+	// errInvalidPixelDataAttribute indicates that an attribute needed to parse
+	// native PixelData (Rows, Columns, BitsAllocated, SamplesPerPixel,
+	// NumberOfFrames) is missing, has an unexpected value type, holds the wrong
+	// number of values, or combines to an invalid or overflowing frame size.
+	errInvalidPixelDataAttribute = errors.New("invalid or inconsistent pixel data dimension attribute")
 )
+
+// singleIntAttribute extracts the single integer value of the element identified
+// by t from parsedData. Unlike MustGetInts, it never panics: a missing element,
+// a non-Ints value type, or a value that does not contain exactly one entry is
+// reported as an error wrapping errInvalidPixelDataAttribute.
+func singleIntAttribute(parsedData *Dataset, t tag.Tag) (int, error) {
+	elem, err := parsedData.FindElementByTag(t)
+	if err != nil {
+		return 0, fmt.Errorf("%w: error finding %s element: %w", errInvalidPixelDataAttribute, t.String(), err)
+	}
+	if elem.Value == nil || elem.Value.ValueType() != Ints {
+		return 0, fmt.Errorf("%w: %s must hold an integer value, got %v", errInvalidPixelDataAttribute, t.String(), elem.Value)
+	}
+	vals, ok := elem.Value.GetValue().([]int)
+	if !ok || len(vals) != 1 {
+		return 0, fmt.Errorf("%w: %s must contain exactly one integer, got %d value(s)", errInvalidPixelDataAttribute, t.String(), len(vals))
+	}
+	return vals[0], nil
+}
+
+// mulIntChecked returns a*b and true when the operands are non-negative and the
+// product does not overflow the platform int. It is portable across 32-bit and
+// 64-bit builds because the guard compares against math.MaxInt before multiplying.
+func mulIntChecked(a, b int) (int, bool) {
+	if a < 0 || b < 0 {
+		return 0, false
+	}
+	if a != 0 && b > math.MaxInt/a {
+		return 0, false
+	}
+	return a * b, true
+}
 
 // reader is responsible for mid-level dicom parsing capabilities, like
 // reading tags, VRs, and elements from the low-level *dicomio.Reader dicom data.
@@ -415,63 +453,123 @@ func makeErrorPixelData(reader io.Reader, vl uint32, fc chan<- *frame.Frame, par
 // that should be available in parsedData (elements like NumberOfFrames, rows, columns, etc)
 func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, vl uint32) (pixelData *PixelDataInfo,
 	bytesToRead int, err error) {
-	// Parse information from previously parsed attributes that are needed to parse NativeData Frames:
-	rows, err := parsedData.FindElementByTag(tag.Rows)
+	// Parse information from previously parsed attributes that are needed to parse NativeData Frames.
+	// These are extracted with explicit type checks so that malformed attribute
+	// value types return an error instead of panicking via MustGetInts.
+	rows, err := singleIntAttribute(parsedData, tag.Rows)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding Rows tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
 	}
 
-	cols, err := parsedData.FindElementByTag(tag.Columns)
+	cols, err := singleIntAttribute(parsedData, tag.Columns)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding Columns tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
 	}
 
-	nof, err := parsedData.FindElementByTag(tag.NumberOfFrames)
 	nFrames := 0
-	if err == nil {
-		// No error, so parse number of frames
-		nFrames, err = strconv.Atoi(MustGetStrings(nof.Value)[0]) // odd that number of frames is encoded as a string...
+	nof, nofErr := parsedData.FindElementByTag(tag.NumberOfFrames)
+	if nofErr == nil {
+		// NumberOfFrames is encoded as a string; validate the type before indexing.
+		if nof.Value == nil || nof.Value.ValueType() != Strings {
+			return nil, 0, fmt.Errorf("readNativeFrames: %w: NumberOfFrames must hold a string value, got %v", errInvalidPixelDataAttribute, nof.Value)
+		}
+		nofStrings, ok := nof.Value.GetValue().([]string)
+		if !ok || len(nofStrings) != 1 {
+			return nil, 0, fmt.Errorf("readNativeFrames: %w: NumberOfFrames must contain exactly one string, got %d value(s)", errInvalidPixelDataAttribute, len(nofStrings))
+		}
+		nFrames, err = strconv.Atoi(nofStrings[0])
 		if err != nil {
 			return nil, 0, fmt.Errorf("readNativeFrames: error converting NumberOfFrames from string to int: %w", err)
 		}
-	} else {
-		// error fetching NumberOfFrames, so default to 1. TODO: revisit
+	} else if errors.Is(nofErr, ErrorElementNotFound) {
+		// NumberOfFrames absent, so default to a single frame.
 		nFrames = 1
+	} else {
+		return nil, 0, fmt.Errorf("readNativeFrames: error finding NumberOfFrames tag: %w", nofErr)
 	}
 
-	b, err := parsedData.FindElementByTag(tag.BitsAllocated)
+	bitsAllocated, err := singleIntAttribute(parsedData, tag.BitsAllocated)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding BitsAllocated tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
 	}
-	bitsAllocated := MustGetInts(b.Value)[0]
 
-	s, err := parsedData.FindElementByTag(tag.SamplesPerPixel)
+	samplesPerPixel, err := singleIntAttribute(parsedData, tag.SamplesPerPixel)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding SamplesPerPixel tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
 	}
-	samplesPerPixel := MustGetInts(s.Value)[0]
 
-	pixelsPerFrame := MustGetInts(rows.Value)[0] * MustGetInts(cols.Value)[0]
+	// Validate the attributes before any allocation. Zero or negative values
+	// would otherwise produce empty backing slices followed by out-of-range
+	// index panics.
+	if rows <= 0 || cols <= 0 || nFrames <= 0 || samplesPerPixel <= 0 || bitsAllocated <= 0 {
+		return nil, 0, fmt.Errorf("readNativeFrames: %w: Rows=%d Columns=%d NumberOfFrames=%d SamplesPerPixel=%d BitsAllocated=%d must all be positive",
+			errInvalidPixelDataAttribute, rows, cols, nFrames, samplesPerPixel, bitsAllocated)
+	}
 
-	debug.Logf("readNativeFrames:\nRows: %d\nCols:%d\nFrames::%d\nBitsAlloc:%d\nSamplesPerPixel:%d", MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], nFrames, bitsAllocated, samplesPerPixel)
+	// Only these BitsAllocated widths have a native frame representation. This
+	// both preserves ErrorUnsupportedBitsAllocated for widths such as 24 and
+	// cleanly rejects odd/unsupported widths instead of mis-sizing buffers.
+	switch bitsAllocated {
+	case 1, 8, 16, 32:
+	default:
+		return nil, 0, fmt.Errorf("readNativeFrames: unsupported BitsAllocated, got: %v, %w", bitsAllocated, ErrorUnsupportedBitsAllocated)
+	}
 
-	bytesAllocated := bitsAllocated / 8
-	bytesToRead = bytesAllocated * samplesPerPixel * pixelsPerFrame * nFrames
+	// All size arithmetic is overflow-checked, on both 32-bit and 64-bit
+	// platforms, before any backing slice is allocated.
+	pixelsPerFrame, ok := mulIntChecked(rows, cols)
+	if !ok {
+		return nil, 0, fmt.Errorf("readNativeFrames: %w: Rows(%d)*Columns(%d) overflows", errInvalidPixelDataAttribute, rows, cols)
+	}
+	samplesPerFrame, ok := mulIntChecked(pixelsPerFrame, samplesPerPixel)
+	if !ok {
+		return nil, 0, fmt.Errorf("readNativeFrames: %w: pixelsPerFrame(%d)*SamplesPerPixel(%d) overflows", errInvalidPixelDataAttribute, pixelsPerFrame, samplesPerPixel)
+	}
+
+	// totalBytes is the number of encoded bytes expected across all frames. It is
+	// kept in int64 for the VL comparison below so that lengths larger than 32
+	// bits are never truncated.
+	var totalBytes int64
 	if bitsAllocated == 1 {
-		bytesToRead = pixelsPerFrame * samplesPerPixel / 8 * nFrames
+		// 1-bit samples are packed eight to a byte; each frame's sample count
+		// must be a whole number of bytes.
+		if samplesPerFrame%8 != 0 {
+			return nil, 0, errors.New("when bitsAllocated is 1, we can't read a number of samples that is not a multiple of 8")
+		}
+		totalSamples, ok := mulIntChecked(samplesPerFrame, nFrames)
+		if !ok {
+			return nil, 0, fmt.Errorf("readNativeFrames: %w: total packed sample count overflows", errInvalidPixelDataAttribute)
+		}
+		totalBytes = int64(totalSamples / 8)
+	} else {
+		bytesAllocated := bitsAllocated / 8
+		frameBytes, ok := mulIntChecked(samplesPerFrame, bytesAllocated)
+		if !ok {
+			return nil, 0, fmt.Errorf("readNativeFrames: %w: frame byte size overflows", errInvalidPixelDataAttribute)
+		}
+		allFrameBytes, ok := mulIntChecked(frameBytes, nFrames)
+		if !ok {
+			return nil, 0, fmt.Errorf("readNativeFrames: %w: total pixel byte size overflows", errInvalidPixelDataAttribute)
+		}
+		totalBytes = int64(allFrameBytes)
 	}
 
+	debug.Logf("readNativeFrames:\nRows: %d\nCols:%d\nFrames::%d\nBitsAlloc:%d\nSamplesPerPixel:%d", rows, cols, nFrames, bitsAllocated, samplesPerPixel)
+
+	// Compare the computed size against the element's Value Length in 64-bit
+	// signed space without truncating either side. A trailing single padding
+	// byte (used to keep the element VL even) is distinguished from frame data.
 	skipFinalPaddingByte := false
-	if uint32(bytesToRead) != vl {
+	if totalBytes != int64(vl) {
 		switch {
-		case uint32(bytesToRead) == vl-1 && vl%2 == 0:
+		case totalBytes == int64(vl)-1 && vl%2 == 0:
 			skipFinalPaddingByte = true
-		case uint32(bytesToRead) == vl-1 && vl%2 != 0:
+		case totalBytes == int64(vl)-1 && vl%2 != 0:
 			return nil, 0, fmt.Errorf("error when reading Native PixelData, got vl=%d, expected even VL: %w", vl, ErrorExpectedEvenLength)
 		default:
-			// calculated bytesToRead and actual VL mismatch
+			// calculated totalBytes and actual VL mismatch
 			if !r.opts.allowMismatchPixelDataLength {
-				return nil, 0, fmt.Errorf("error when reading Native PixelData: expected_vl=%d actual_vl=%d %w", bytesToRead, vl, ErrorMismatchPixelDataLength)
+				return nil, 0, fmt.Errorf("error when reading Native PixelData: expected_vl=%d actual_vl=%d %w", totalBytes, vl, ErrorMismatchPixelDataLength)
 			}
 			image, err := makeErrorPixelData(r.rawReader, vl, fc, ErrorMismatchPixelDataLength)
 			if err != nil {
@@ -481,13 +579,22 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 		}
 	}
 
+	// Bound all pixel reads to this element's declared VL. With validated
+	// dimensions this both prevents any out-of-bounds slice access and ensures a
+	// malformed entry can never deliver bytes of following elements as pixels.
+	if err := r.rawReader.PushLimit(int64(vl)); err != nil {
+		return nil, 0, fmt.Errorf("readNativeFrames: error setting pixel data read limit: %w", err)
+	}
+	defer r.rawReader.PopLimit()
+
 	// Parse the pixels:
 	image := PixelDataInfo{
 		IsEncapsulated: false,
 	}
 	image.Frames = make([]*frame.Frame, nFrames)
 	bo := r.rawReader.ByteOrder()
-	pixelBuf := make([]byte, bytesAllocated)
+	pixelBuf := make([]byte, bitsAllocated/8)
+	frameByteSize := int(totalBytes / int64(nFrames))
 	for frameIdx := 0; frameIdx < nFrames; frameIdx++ {
 		// Init current frame
 		currentFrame := frame.Frame{
@@ -495,11 +602,11 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 		}
 
 		if bitsAllocated == 1 {
-			buf := make([]int, pixelsPerFrame*samplesPerPixel) // override buf for now
+			buf := make([]int, samplesPerFrame) // override buf for now
 			if err := fillBufferSingleBitAllocated(buf, r.rawReader, bo); err != nil {
-				return nil, bytesToRead, err
+				return nil, frameByteSize, err
 			}
-			nativeFrame := frame.NewNativeFrame[int](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], pixelsPerFrame, samplesPerPixel)
+			nativeFrame := frame.NewNativeFrame[int](bitsAllocated, rows, cols, pixelsPerFrame, samplesPerPixel)
 			for pixel := 0; pixel < pixelsPerFrame; pixel++ {
 				for value := 0; value < samplesPerPixel; value++ {
 					nativeFrame.RawData[(pixel*samplesPerPixel)+value] = buf[pixel*samplesPerPixel+value]
@@ -509,17 +616,17 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 		} else {
 			switch bitsAllocated {
 			case 8:
-				currentFrame, _, err = readNativeFrame[uint8](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
+				currentFrame, _, err = readNativeFrame[uint8](bitsAllocated, rows, cols, frameByteSize, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
 			case 16:
-				currentFrame, _, err = readNativeFrame[uint16](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
+				currentFrame, _, err = readNativeFrame[uint16](bitsAllocated, rows, cols, frameByteSize, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
 			case 32:
-				currentFrame, _, err = readNativeFrame[uint32](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
+				currentFrame, _, err = readNativeFrame[uint32](bitsAllocated, rows, cols, frameByteSize, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
 			default:
-				return nil, bytesToRead, fmt.Errorf("unsupported bitsAllocated, got: %v, %w", bitsAllocated, ErrorUnsupportedBitsAllocated)
+				return nil, frameByteSize, fmt.Errorf("unsupported bitsAllocated, got: %v, %w", bitsAllocated, ErrorUnsupportedBitsAllocated)
 			}
 		}
 		if err != nil {
-			return nil, bytesToRead, err
+			return nil, frameByteSize, err
 		}
 		image.Frames[frameIdx] = &currentFrame
 		if fc != nil {
@@ -529,11 +636,16 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 	if skipFinalPaddingByte {
 		err := r.rawReader.Skip(1)
 		if err != nil {
-			return nil, bytesToRead, fmt.Errorf("error when reading Native PixelData: could not read padding byte, when one needed to be skipped: %w", err)
+			return nil, frameByteSize, fmt.Errorf("error when reading Native PixelData: could not read padding byte, when one needed to be skipped: %w", err)
 		}
-		bytesToRead++
 	}
-	return &image, bytesToRead, nil
+	// Report the number of encoded pixel bytes consumed, including any trailing
+	// padding byte, to preserve the historical bytesToRead accounting.
+	consumed := int(totalBytes)
+	if skipFinalPaddingByte {
+		consumed++
+	}
+	return &image, consumed, nil
 }
 
 // readNativeFrame builds and reads a single NativeFrame[I] from the rawReader.

@@ -1087,3 +1087,275 @@ func buildTagData(t *testing.T, tg tag.Tag) []byte {
 
 	return data.Bytes()
 }
+
+// newNativeFramesReader builds an in-package reader over dataBytes with a hard
+// limit matching the provided Value Length.
+func newNativeFramesReader(dataBytes []byte, vl uint32) *reader {
+	return &reader{
+		rawReader: dicomio.NewReader(bufio.NewReader(bytes.NewReader(dataBytes)), binary.LittleEndian, int64(vl)),
+	}
+}
+
+// pixelDimensionDataset builds a Dataset holding the attributes needed to parse
+// native PixelData. Individual attributes can be overridden (including with
+// wrong-typed values) via the overrides map.
+func pixelDimensionDataset(rows, cols, nFrames, bitsAllocated, samplesPerPixel int, overrides map[tag.Tag]*Element) Dataset {
+	elems := []*Element{
+		mustNewElement(tag.Rows, []int{rows}),
+		mustNewElement(tag.Columns, []int{cols}),
+		mustNewElement(tag.NumberOfFrames, []string{strconv.Itoa(nFrames)}),
+		mustNewElement(tag.BitsAllocated, []int{bitsAllocated}),
+		mustNewElement(tag.SamplesPerPixel, []int{samplesPerPixel}),
+	}
+	if overrides != nil {
+		for i, e := range elems {
+			if replacement, ok := overrides[e.Tag]; ok {
+				elems[i] = replacement
+			}
+		}
+	}
+	return Dataset{Elements: elems}
+}
+
+// TestReadNativeFrames_MalformedDimensions ensures malicious or malformed
+// dimension attributes produce clear errors instead of panics, oversized
+// allocations, truncation-driven mismatches, or out-of-bounds slices.
+func TestReadNativeFrames_MalformedDimensions(t *testing.T) {
+	// uint32 truncation attack: 2*2*1*(2^30+2) bytes = 2^32 + 8, whose low 32
+	// bits equal 8. The old uint32() cast treated this as matching a VL of 8 and
+	// attempted a multi-gigabyte allocation.
+	truncationFrames := (1 << 30) + 2
+
+	cases := []struct {
+		name        string
+		dataset     Dataset
+		vl          uint32
+		dataBytes   []byte
+		wantErr     error
+		skip32Bit   bool // test relies on 64-bit int arithmetic
+		wantNoPanic bool
+	}{
+		{
+			name:      "uint32 truncation of oversized frame declaration",
+			skip32Bit: true,
+			dataset:   pixelDimensionDataset(2, 2, truncationFrames, 8, 1, nil),
+			vl:        8,
+			dataBytes: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+			wantErr:   ErrorMismatchPixelDataLength,
+		},
+		{
+			name:      "checked multiplication overflow",
+			skip32Bit: true,
+			// 3000000*3000000 alone is 9e12; multiplied by SamplesPerPixel(3)
+			// and NumberOfFrames(1000000000) it exceeds math.MaxInt64, while
+			// every individual attribute still fits in int32.
+			dataset:   pixelDimensionDataset(3000000, 3000000, 1000000000, 8, 3, nil),
+			vl:        8,
+			dataBytes: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+			wantErr:   errInvalidPixelDataAttribute,
+		},
+		{
+			name:      "zero rows",
+			dataset:   pixelDimensionDataset(0, 2, 1, 8, 1, nil),
+			vl:        4,
+			dataBytes: []byte{1, 2, 3, 4},
+			wantErr:   errInvalidPixelDataAttribute,
+		},
+		{
+			name:      "negative columns",
+			dataset:   pixelDimensionDataset(2, -2, 1, 8, 1, nil),
+			vl:        4,
+			dataBytes: []byte{1, 2, 3, 4},
+			wantErr:   errInvalidPixelDataAttribute,
+		},
+		{
+			name:      "zero samples per pixel",
+			dataset:   pixelDimensionDataset(2, 2, 1, 8, 0, nil),
+			vl:        4,
+			dataBytes: []byte{1, 2, 3, 4},
+			wantErr:   errInvalidPixelDataAttribute,
+		},
+		{
+			name:      "unsupported odd bitsAllocated",
+			dataset:   pixelDimensionDataset(2, 2, 1, 4, 1, nil),
+			vl:        2,
+			dataBytes: []byte{1, 2},
+			wantErr:   ErrorUnsupportedBitsAllocated,
+		},
+		{
+			name:      "unsupported 24-bit bitsAllocated",
+			dataset:   pixelDimensionDataset(2, 2, 1, 24, 1, nil),
+			vl:        12,
+			dataBytes: make([]byte, 12),
+			wantErr:   ErrorUnsupportedBitsAllocated,
+		},
+		{
+			name: "BitsAllocated has wrong value type",
+			dataset: pixelDimensionDataset(2, 2, 1, 8, 1, map[tag.Tag]*Element{
+				tag.BitsAllocated: {
+					Tag:                 tag.BitsAllocated,
+					ValueRepresentation: tag.VRString,
+					Value:               &stringsValue{value: []string{"not-an-int"}},
+				},
+			}),
+			vl:          4,
+			dataBytes:   []byte{1, 2, 3, 4},
+			wantErr:     errInvalidPixelDataAttribute,
+			wantNoPanic: true,
+		},
+		{
+			name: "NumberOfFrames has wrong value type",
+			dataset: pixelDimensionDataset(2, 2, 1, 8, 1, map[tag.Tag]*Element{
+				tag.NumberOfFrames: {
+					Tag:                 tag.NumberOfFrames,
+					ValueRepresentation: tag.VRBytes,
+					Value:               &bytesValue{value: []byte{1, 2, 3, 4}},
+				},
+			}),
+			vl:          4,
+			dataBytes:   []byte{1, 2, 3, 4},
+			wantErr:     errInvalidPixelDataAttribute,
+			wantNoPanic: true,
+		},
+		{
+			name: "Rows has no values",
+			dataset: pixelDimensionDataset(2, 2, 1, 8, 1, map[tag.Tag]*Element{
+				tag.Rows: {
+					Tag:                 tag.Rows,
+					ValueRepresentation: tag.VRUInt16List,
+					Value:               &intsValue{value: []int{}},
+				},
+			}),
+			vl:          4,
+			dataBytes:   []byte{1, 2, 3, 4},
+			wantErr:     errInvalidPixelDataAttribute,
+			wantNoPanic: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip32Bit && strconv.IntSize < 64 {
+				t.Skip("this case requires 64-bit int arithmetic")
+			}
+			r := newNativeFramesReader(tc.dataBytes, tc.vl)
+
+			var (
+				pixelData *PixelDataInfo
+				err       error
+				panicked  any
+			)
+			func() {
+				defer func() {
+					panicked = recover()
+				}()
+				pixelData, _, err = r.readNativeFrames(&tc.dataset, nil, tc.vl)
+			}()
+
+			if panicked != nil {
+				t.Fatalf("readNativeFrames panicked on malformed input: %v", panicked)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("readNativeFrames unexpected error. got: %v, want: %v", err, tc.wantErr)
+			}
+			if pixelData != nil {
+				t.Fatalf("expected nil PixelDataInfo on error, got: %+v", pixelData)
+			}
+		})
+	}
+}
+
+// TestReadNativeFrames_TruncatedData verifies that when the dimension-derived
+// length matches the declared VL but the underlying stream is short, the read
+// fails cleanly (bounded by the pushed VL limit) without panicking or reading
+// past the element boundary.
+func TestReadNativeFrames_TruncatedData(t *testing.T) {
+	// 2x2, 1 frame, 1 sample/pixel, 16-bit => 8 expected bytes, supply only 6.
+	dataset := pixelDimensionDataset(2, 2, 1, 16, 1, nil)
+	dataBytes := []byte{1, 0, 2, 0, 3, 0} // 6 bytes instead of 8
+	vl := uint32(8)
+	r := newNativeFramesReader(dataBytes, vl)
+
+	var panicked any
+	_, _, err := func() (pd *PixelDataInfo, n int, e error) {
+		defer func() { panicked = recover() }()
+		return r.readNativeFrames(&dataset, nil, vl)
+	}()
+
+	if panicked != nil {
+		t.Fatalf("readNativeFrames panicked on truncated input: %v", panicked)
+	}
+	if err == nil {
+		t.Fatal("expected an error for truncated pixel data, got nil")
+	}
+	// The hard VL limit must have prevented consuming beyond the element.
+	if left := r.rawReader.BytesLeftUntilLimit(); left < 0 {
+		t.Fatalf("reader advanced past the pixel data VL limit, bytes left: %d", left)
+	}
+}
+
+// TestReadNativeFrames_FrameBoundaryAndPadding confirms multi-frame decoding
+// keeps frame boundaries distinct and that a single trailing even-VL padding
+// byte is not delivered as pixel data.
+func TestReadNativeFrames_FrameBoundaryAndPadding(t *testing.T) {
+	// 2 frames of 1x1 8-bit with 1 sample each = 1 byte per frame; across both
+	// frames that is 2 pixel bytes, which is even and needs no padding. To
+	// exercise the padding path use 3 pixel bytes total (odd) with one trailing
+	// padding byte to reach an even VL of 4: frame 0 gets bytes {1,2,3} via a
+	// 1x3 frame, and we use a single frame so the padding is unambiguous.
+	dataset := pixelDimensionDataset(1, 3, 1, 8, 1, nil) // 3 pixels/frame, 1 frame
+	dataBytes := []byte{1, 2, 3, 0}                      // 3 pixel bytes + padding 0
+	vl := uint32(4)                                      // even VL; computed pixel size is 3
+	r := newNativeFramesReader(dataBytes, vl)
+
+	pixelData, bytesRead, err := r.readNativeFrames(&dataset, nil, vl)
+	if err != nil {
+		t.Fatalf("readNativeFrames unexpected error: %v", err)
+	}
+	if bytesRead != 4 {
+		t.Errorf("bytesRead = %d, want 4 (including padding byte)", bytesRead)
+	}
+	if len(pixelData.Frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(pixelData.Frames))
+	}
+	frame0 := pixelData.Frames[0].NativeData.RawDataSlice().([]uint8)
+	if diff := cmp.Diff([]uint8{1, 2, 3}, frame0); diff != "" {
+		t.Errorf("frame mismatch (-want +got):\n%s", diff)
+	}
+	if r.rawReader.BytesLeftUntilLimit() != 0 {
+		t.Errorf("expected reader to be exactly at VL limit, bytes left: %d", r.rawReader.BytesLeftUntilLimit())
+	}
+}
+
+// TestReadNativeFrames_MultiFrameBoundary decodes two frames without padding and
+// verifies each frame receives only its own bytes.
+func TestReadNativeFrames_MultiFrameBoundary(t *testing.T) {
+	// 2 frames of 1x2 8-bit 1 sample = 2 bytes per frame, 4 total, no padding.
+	dataset := pixelDimensionDataset(1, 2, 2, 8, 1, nil)
+	dataBytes := []byte{1, 2, 3, 4}
+	vl := uint32(4)
+	r := newNativeFramesReader(dataBytes, vl)
+
+	pixelData, bytesRead, err := r.readNativeFrames(&dataset, nil, vl)
+	if err != nil {
+		t.Fatalf("readNativeFrames unexpected error: %v", err)
+	}
+	if bytesRead != 4 {
+		t.Errorf("bytesRead = %d, want 4", bytesRead)
+	}
+	if len(pixelData.Frames) != 2 {
+		t.Fatalf("expected 2 frames, got %d", len(pixelData.Frames))
+	}
+	first := pixelData.Frames[0].NativeData.RawDataSlice().([]uint8)
+	second := pixelData.Frames[1].NativeData.RawDataSlice().([]uint8)
+	if diff := cmp.Diff([]uint8{1, 2}, first); diff != "" {
+		t.Errorf("first frame mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]uint8{3, 4}, second); diff != "" {
+		t.Errorf("second frame mismatch (-want +got):\n%s", diff)
+	}
+	if r.rawReader.BytesLeftUntilLimit() != 0 {
+		t.Errorf("expected reader to be exactly at VL limit, bytes left: %d", r.rawReader.BytesLeftUntilLimit())
+	}
+}
