@@ -34,6 +34,14 @@ var (
 	ErrorExpectedEvenLength           = errors.New("field length is not even, in violation of DICOM spec")
 	ErrorExpectedDefinedLength        = errors.New("unable to read field of undefined length")
 	ErrorExpectedSequenceDelimitation = errors.New("expected to find sequence delimitation item (fffe,e0dd)")
+	// ErrorExpectedItemDelimitation indicates that an item delimitation item
+	// was expected (e.g. the input ended or an enclosing length limit was
+	// reached) but not found.
+	ErrorExpectedItemDelimitation = errors.New("expected to find item delimitation item (fffe,e00d)")
+	// ErrorExceedsMaxNestedDepth indicates that the nesting depth of
+	// sequences and items exceeded the budget set via the
+	// MaxNestedElementDepth parse option.
+	ErrorExceedsMaxNestedDepth = errors.New("exceeded maximum nesting depth of sequences and items")
 )
 
 // reader is responsible for mid-level dicom parsing capabilities, like
@@ -44,6 +52,30 @@ var (
 type reader struct {
 	rawReader *dicomio.Reader
 	opts      parseOptSet
+	// nestedDepth tracks the current nesting depth of sequences and items
+	// being parsed, so that a caller-provided budget (see
+	// MaxNestedElementDepth) can be enforced and parsing resources stay
+	// bounded for untrusted input.
+	nestedDepth int
+}
+
+// enterNestedLevel records that the parser is descending one level deeper
+// into nested sequences/items, enforcing the maxNestedDepth budget if one is
+// set. It must be paired with a call to exitNestedLevel.
+func (r *reader) enterNestedLevel() error {
+	r.nestedDepth++
+	if r.opts.maxNestedDepth > 0 && r.nestedDepth > r.opts.maxNestedDepth {
+		r.nestedDepth--
+		return fmt.Errorf("nesting depth %d exceeds the maximum allowed depth of %d: %w",
+			r.nestedDepth+1, r.opts.maxNestedDepth, ErrorExceedsMaxNestedDepth)
+	}
+	return nil
+}
+
+// exitNestedLevel records that the parser has returned one level up from
+// nested sequences/items.
+func (r *reader) exitNestedLevel() {
+	r.nestedDepth--
 }
 
 func (r *reader) readTag() (*tag.Tag, error) {
@@ -285,13 +317,15 @@ func (r *reader) readPixelData(vl uint32, d *Dataset, fc chan<- *frame.Frame) (V
 			return nil, fmt.Errorf("readPixelData: error skipping basic offset table: %w", err)
 		}
 
+		foundDelimitation := false
 		for !r.rawReader.IsLimitExhausted() {
 			data, endOfItems, err := r.readRawItem(r.opts.skipPixelData /*shouldSkip*/)
 			if err != nil {
-				break
+				return nil, fmt.Errorf("readPixelData: error reading encapsulated pixel data item: %w", err)
 			}
 
 			if endOfItems {
+				foundDelimitation = true
 				break
 			}
 
@@ -307,6 +341,9 @@ func (r *reader) readPixelData(vl uint32, d *Dataset, fc chan<- *frame.Frame) (V
 			}
 
 			image.Frames = append(image.Frames, &f)
+		}
+		if !foundDelimitation {
+			return nil, fmt.Errorf("readPixelData: reached end of input within encapsulated pixel data: %w", ErrorExpectedSequenceDelimitation)
 		}
 		image.IntentionallySkipped = r.opts.skipPixelData
 		return &pixelDataValue{PixelDataInfo: image}, nil
@@ -586,11 +623,21 @@ func readNativeFrame[I constraints.Integer](bitsAllocated, rows, cols, bytesToRe
 func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Value, error) {
 	var sequences sequencesValue
 
+	if err := r.enterNestedLevel(); err != nil {
+		return nil, err
+	}
+	defer r.exitNestedLevel()
+
 	seqElements := &Dataset{}
 	if vl == tag.VLUndefinedLength {
 		for {
 			subElement, err := r.readElement(seqElements, nil)
 			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					// The input (or enclosing length limit) ended before the
+					// sequence delimitation item was found.
+					return nil, fmt.Errorf("readSequence: reached end of input within a sequence of undefined length: %w", ErrorExpectedSequenceDelimitation)
+				}
 				// Stop reading due to error
 				return nil, fmt.Errorf("readSequence: error reading subitem in a sequence: %w", err)
 			}
@@ -614,6 +661,9 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 		if err != nil {
 			return nil, err
 		}
+		// Ensure the pushed limit is always released, even if parsing a
+		// subelement fails, so the enclosing length boundaries remain intact.
+		defer r.rawReader.PopLimit()
 		for !r.rawReader.IsLimitExhausted() {
 			subElement, err := r.readElement(seqElements, nil)
 			if err != nil {
@@ -624,7 +674,6 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 			// Append the Item element's dataset of elements to this Sequence's sequencesValue.
 			sequences.value = append(sequences.value, subElement.Value.(*SequenceItemValue))
 		}
-		r.rawReader.PopLimit()
 	}
 
 	return &sequences, nil
@@ -635,6 +684,11 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (Value, error) {
 	var sequenceItem SequenceItemValue
 
+	if err := r.enterNestedLevel(); err != nil {
+		return nil, err
+	}
+	defer r.exitNestedLevel()
+
 	// seqElements holds items read so far.
 	// TODO: deduplicate with sequenceItem above
 	seqElements := Dataset{}
@@ -643,6 +697,11 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 		for {
 			subElem, err := r.readElement(&seqElements, nil)
 			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					// The input (or enclosing length limit) ended before the
+					// item delimitation item was found.
+					return nil, fmt.Errorf("readSequenceItem: reached end of input within an item of undefined length: %w", ErrorExpectedItemDelimitation)
+				}
 				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)
 			}
 			if subElem.Tag == tag.ItemDelimitationItem {
@@ -657,6 +716,9 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 		if err != nil {
 			return nil, err
 		}
+		// Ensure the pushed limit is always released, even if parsing a
+		// subelement fails, so the enclosing length boundaries remain intact.
+		defer r.rawReader.PopLimit()
 
 		for !r.rawReader.IsLimitExhausted() {
 			subElem, err := r.readElement(&seqElements, nil)
@@ -667,7 +729,6 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 			sequenceItem.elements = append(sequenceItem.elements, subElem)
 			seqElements.Elements = append(seqElements.Elements, subElem)
 		}
-		r.rawReader.PopLimit()
 	}
 
 	return &sequenceItem, nil
@@ -738,6 +799,8 @@ func (r *reader) readFloat(t tag.Tag, vr string, vl uint32) (Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Ensure the pushed limit is always released, even on error.
+	defer r.rawReader.PopLimit()
 	retVal := &floatsValue{value: make([]float64, 0, vl/2)}
 	for !r.rawReader.IsLimitExhausted() {
 		switch vr {
@@ -766,7 +829,6 @@ func (r *reader) readFloat(t tag.Tag, vr string, vl uint32) (Value, error) {
 			return nil, fmt.Errorf("error reading floating point element(%v) value: unsupported VR: %w", t, errorUnableToParseFloat)
 		}
 	}
-	r.rawReader.PopLimit()
 	return retVal, nil
 }
 
@@ -787,6 +849,8 @@ func (r *reader) readInt(t tag.Tag, vr string, vl uint32) (Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Ensure the pushed limit is always released, even on error.
+	defer r.rawReader.PopLimit()
 	retVal := &intsValue{value: make([]int, 0, vl/2)}
 	for !r.rawReader.IsLimitExhausted() {
 		switch vr {
@@ -822,7 +886,6 @@ func (r *reader) readInt(t tag.Tag, vr string, vl uint32) (Value, error) {
 			return nil, fmt.Errorf("unable to parse integer type due to unknown VR %v", vr)
 		}
 	}
-	r.rawReader.PopLimit()
 	return retVal, err
 }
 

@@ -2,7 +2,9 @@ package dicom_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/jpeg"
 	"io"
@@ -372,4 +374,206 @@ func runForEveryTestFile(t *testing.T, testFunc func(t *testing.T, filename stri
 			})
 		}
 	}
+}
+
+// writeImplicitTag appends a little-endian tag and 4-byte VL (implicit VR
+// element header) to buf.
+func writeImplicitTag(buf *bytes.Buffer, tg tag.Tag, vl uint32) {
+	_ = binary.Write(buf, binary.LittleEndian, tg.Group)
+	_ = binary.Write(buf, binary.LittleEndian, tg.Element)
+	_ = binary.Write(buf, binary.LittleEndian, vl)
+}
+
+// buildImplicitLEHeader builds a DICOM preamble and group 2 metadata
+// declaring the Implicit VR Little Endian transfer syntax.
+func buildImplicitLEHeader() []byte {
+	meta := &bytes.Buffer{}
+	// (0002,0010) TransferSyntaxUID = Implicit VR Little Endian.
+	ts := "1.2.840.10008.1.2"
+	if len(ts)%2 != 0 {
+		ts += "\x00"
+	}
+	_ = binary.Write(meta, binary.LittleEndian, uint16(0x0002))
+	_ = binary.Write(meta, binary.LittleEndian, uint16(0x0010))
+	meta.WriteString("UI")
+	_ = binary.Write(meta, binary.LittleEndian, uint16(len(ts)))
+	meta.WriteString(ts)
+
+	buf := &bytes.Buffer{}
+	buf.Write(make([]byte, 128)) // preamble
+	buf.WriteString("DICM")
+	// (0002,0000) FileMetaInformationGroupLength.
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0002))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0000))
+	buf.WriteString("UL")
+	_ = binary.Write(buf, binary.LittleEndian, uint16(4))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(meta.Len()))
+	buf.Write(meta.Bytes())
+	return buf.Bytes()
+}
+
+// buildMixedLengthNesting builds an implicit VR little endian DICOM body with
+// sequences and items nested with interleaved defined and undefined lengths:
+//
+//	ReferencedImageSequence (undefined length)
+//	  Item (defined length)
+//	    ReferencedStudySequence (defined length)
+//	      Item (undefined length)
+//	        PatientName = "Bob "
+//	        Item Delimitation Item
+//	    PixelData (undefined length, encapsulated, one frame {1,2,3,4})
+//	  Sequence Delimitation Item
+func buildMixedLengthNesting() []byte {
+	// Innermost item: PatientName, closed by an item delimitation item.
+	innerItem := &bytes.Buffer{}
+	writeImplicitTag(innerItem, tag.PatientName, 4)
+	innerItem.WriteString("Bob ")
+	writeImplicitTag(innerItem, tag.ItemDelimitationItem, 0)
+
+	// ReferencedStudySequence with a defined length.
+	studySeq := &bytes.Buffer{}
+	writeImplicitTag(studySeq, tag.Item, tag.VLUndefinedLength)
+	studySeq.Write(innerItem.Bytes())
+
+	// Encapsulated PixelData of undefined length with one frame.
+	pixelData := &bytes.Buffer{}
+	writeImplicitTag(pixelData, tag.Item, 0) // basic offset table
+	writeImplicitTag(pixelData, tag.Item, 4)
+	pixelData.Write([]byte{1, 2, 3, 4})
+	writeImplicitTag(pixelData, tag.SequenceDelimitationItem, 0)
+
+	// Item of the outer sequence with a defined length.
+	outerItemContents := &bytes.Buffer{}
+	writeImplicitTag(outerItemContents, tag.ReferencedStudySequence, uint32(studySeq.Len()))
+	outerItemContents.Write(studySeq.Bytes())
+	writeImplicitTag(outerItemContents, tag.PixelData, tag.VLUndefinedLength)
+	outerItemContents.Write(pixelData.Bytes())
+
+	// Outermost sequence with an undefined length.
+	out := &bytes.Buffer{}
+	writeImplicitTag(out, tag.ReferencedImageSequence, tag.VLUndefinedLength)
+	writeImplicitTag(out, tag.Item, uint32(outerItemContents.Len()))
+	out.Write(outerItemContents.Bytes())
+	writeImplicitTag(out, tag.SequenceDelimitationItem, 0)
+
+	return append(buildImplicitLEHeader(), out.Bytes()...)
+}
+
+// buildDeepImplicitNesting builds depth levels of nested undefined-length
+// implicit VR sequences and items, with a PatientName at the innermost level.
+func buildDeepImplicitNesting(depth int) []byte {
+	buf := &bytes.Buffer{}
+	buf.Write(buildImplicitLEHeader())
+	for i := 0; i < depth; i++ {
+		writeImplicitTag(buf, tag.ReferencedImageSequence, tag.VLUndefinedLength)
+		writeImplicitTag(buf, tag.Item, tag.VLUndefinedLength)
+	}
+	writeImplicitTag(buf, tag.PatientName, 4)
+	buf.WriteString("Bob ")
+	for i := 0; i < depth; i++ {
+		writeImplicitTag(buf, tag.ItemDelimitationItem, 0)
+		writeImplicitTag(buf, tag.SequenceDelimitationItem, 0)
+	}
+	return buf.Bytes()
+}
+
+// verifyMixedLengthNesting checks that the dataset produced by parsing
+// buildMixedLengthNesting fully reconstructs the nested items and pixel data.
+func verifyMixedLengthNesting(t *testing.T, ds dicom.Dataset) {
+	t.Helper()
+
+	seqElem, err := ds.FindElementByTag(tag.ReferencedImageSequence)
+	if err != nil {
+		t.Fatalf("unable to find ReferencedImageSequence: %v", err)
+	}
+	items := seqElem.Value.GetValue().([]*dicom.SequenceItemValue)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item in ReferencedImageSequence, got %d", len(items))
+	}
+	outerElems := items[0].GetValue().([]*dicom.Element)
+	if len(outerElems) != 2 {
+		t.Fatalf("expected 2 elements in outer item, got %d", len(outerElems))
+	}
+
+	// The nested defined-length sequence and its undefined-length item.
+	studySeq := outerElems[0]
+	if studySeq.Tag != tag.ReferencedStudySequence {
+		t.Fatalf("expected ReferencedStudySequence, got %v", studySeq.Tag)
+	}
+	studyItems := studySeq.Value.GetValue().([]*dicom.SequenceItemValue)
+	if len(studyItems) != 1 {
+		t.Fatalf("expected 1 item in ReferencedStudySequence, got %d", len(studyItems))
+	}
+	studyElems := studyItems[0].GetValue().([]*dicom.Element)
+	if len(studyElems) != 1 || studyElems[0].Tag != tag.PatientName {
+		t.Fatalf("expected PatientName in nested item, got %v", studyElems)
+	}
+	if got := dicom.MustGetStrings(studyElems[0].Value)[0]; got != "Bob" {
+		t.Errorf("unexpected PatientName: got %q, want %q", got, "Bob")
+	}
+
+	// The encapsulated pixel data nested in the same item.
+	pixelElem := outerElems[1]
+	if pixelElem.Tag != tag.PixelData {
+		t.Fatalf("expected PixelData, got %v", pixelElem.Tag)
+	}
+	pixelData := dicom.MustGetPixelDataInfo(pixelElem.Value)
+	if !pixelData.IsEncapsulated {
+		t.Errorf("expected encapsulated pixel data")
+	}
+	if len(pixelData.Frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(pixelData.Frames))
+	}
+	if got := pixelData.Frames[0].EncapsulatedData.Data; !bytes.Equal(got, []byte{1, 2, 3, 4}) {
+		t.Errorf("unexpected frame data: got %v, want [1 2 3 4]", got)
+	}
+}
+
+// TestParse_MixedLengthNestingMaxDepth verifies that legal nesting with
+// interleaved defined and undefined lengths is fully reconstructed within a
+// depth budget, that exceeding the budget yields a recognizable error, and
+// that a failed parse does not affect parsing subsequent independent inputs.
+func TestParse_MixedLengthNestingMaxDepth(t *testing.T) {
+	data := buildMixedLengthNesting()
+
+	t.Run("within budget parses fully", func(t *testing.T) {
+		ds, err := dicom.ParseUntilEOF(bytes.NewReader(data), nil,
+			dicom.MaxNestedElementDepth(4))
+		if err != nil {
+			t.Fatalf("ParseUntilEOF returned unexpected error: %v", err)
+		}
+		verifyMixedLengthNesting(t, ds)
+	})
+
+	t.Run("default has no depth limit", func(t *testing.T) {
+		ds, err := dicom.ParseUntilEOF(bytes.NewReader(data), nil)
+		if err != nil {
+			t.Fatalf("ParseUntilEOF returned unexpected error: %v", err)
+		}
+		verifyMixedLengthNesting(t, ds)
+	})
+
+	t.Run("budget exceeded gives recognizable error", func(t *testing.T) {
+		_, err := dicom.ParseUntilEOF(bytes.NewReader(data), nil,
+			dicom.MaxNestedElementDepth(3))
+		if !errors.Is(err, dicom.ErrorExceedsMaxNestedDepth) {
+			t.Fatalf("expected ErrorExceedsMaxNestedDepth, got: %v", err)
+		}
+	})
+
+	t.Run("failed parse does not affect subsequent parses", func(t *testing.T) {
+		deep := buildDeepImplicitNesting(1000)
+		_, err := dicom.ParseUntilEOF(bytes.NewReader(deep), nil,
+			dicom.MaxNestedElementDepth(8))
+		if !errors.Is(err, dicom.ErrorExceedsMaxNestedDepth) {
+			t.Fatalf("expected ErrorExceedsMaxNestedDepth, got: %v", err)
+		}
+
+		ds, err := dicom.ParseUntilEOF(bytes.NewReader(data), nil,
+			dicom.MaxNestedElementDepth(8))
+		if err != nil {
+			t.Fatalf("ParseUntilEOF after a failed parse returned unexpected error: %v", err)
+		}
+		verifyMixedLengthNesting(t, ds)
+	})
 }

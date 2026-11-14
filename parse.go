@@ -284,6 +284,9 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+	// maxNestedDepth bounds how deeply sequences and items may be nested
+	// while parsing. A value <= 0 means no limit (the default).
+	maxNestedDepth int
 }
 
 func toParseOptSet(opts ...ParseOption) parseOptSet {
@@ -354,5 +357,25 @@ func SkipPixelData() ParseOption {
 func SkipProcessingPixelDataValue() ParseOption {
 	return func(set *parseOptSet) {
 		set.skipProcessingPixelDataValue = true
+	}
+}
+
+// MaxNestedElementDepth limits how deeply sequences (SQ) and sequence items
+// may be nested within each other while parsing. Each sequence element and
+// each item entered counts as one level of depth, so a top-level sequence
+// containing a single item with a nested sequence has a depth of three.
+//
+// Parsing untrusted DICOMs without a depth limit allows arbitrarily deep
+// nesting (sequences and items with explicit lengths or delimitation markers
+// may be interleaved), which grows the parser's call stack in proportion to
+// the nesting depth. Setting a budget causes parsing to fail with
+// ErrorExceedsMaxNestedDepth once the budget is exceeded, bounding the
+// resources used to parse malicious inputs.
+//
+// A depth <= 0 (the default) means no limit is enforced, preserving the
+// previous parsing behavior.
+func MaxNestedElementDepth(depth int) ParseOption {
+	return func(set *parseOptSet) {
+		set.maxNestedDepth = depth
 	}
 }
